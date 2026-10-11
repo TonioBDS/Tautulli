@@ -1,0 +1,1448 @@
+% if data:
+<%
+    import plexpy
+    from plexpy.helpers import grouper, get_img_service
+
+    recently_added = data['recently_added']
+    if plexpy.CONFIG.NEWSLETTER_SELF_HOSTED and plexpy.CONFIG.HTTP_BASE_URL:
+        base_url = plexpy.CONFIG.HTTP_BASE_URL + plexpy.HTTP_ROOT + 'newsletter/'
+    elif preview:
+        base_url = 'newsletter/'
+    else:
+        base_url = ''
+
+    service = get_img_service(include_self=True)
+    if service == 'self-hosted' and plexpy.CONFIG.HTTP_BASE_URL:
+        base_url_image = plexpy.CONFIG.HTTP_BASE_URL + plexpy.HTTP_ROOT + 'image/'
+    elif preview and service and service != 'self-hosted':
+        base_url_image = 'image/'
+    else:
+        base_url_image = ''
+%>
+<%
+    # =====================================================================
+    # SECTION MAINTAINERR : Media nearly deleted
+    # =====================================================================
+    import datetime
+    from plexpy import helpers, logger
+    from plexpy.pmsconnect import PmsConnect
+    import requests
+
+    # URL of Maintainerr (IP:port or docker host name),
+    # without "/" at the end ! Ex : 'http://192.168.1.50:6246' or 'http://maintainerr:6246'
+    MAINTAINERR_URL = 'http://192.168.0.31:6246'
+
+    # Only show the media that will be deleted in the coming N next days
+    # Set N days here below :
+    MAINTAINERR_DAYS_AHEAD = 7
+
+    # Set here the exact name (Case and accent sensitive) of each collection like it is named in Maintaineer
+    # (column "Title" in tab Collection).
+    MAINTAINERR_COLLECTIONS = [
+        {'heading': 'Films prochainement supprimés',           'collection_name': 'Films prochainement supprimés'},
+        {'heading': 'Séries prochainement supprimées',          'collection_name': 'Séries prochainement supprimées'},
+        {'heading': 'Films Enfants prochainement supprimés',    'collection_name': 'Films Enfants prochainement supprimés'},
+        {'heading': 'Séries Enfants prochainement supprimées',  'collection_name': 'Séries Enfants prochainement supprimées'},
+    ]
+
+    def _tautulli_api_url():
+        scheme = 'https' if plexpy.CONFIG.ENABLE_HTTPS else 'http'
+        return '%s://127.0.0.1:%s%sapi/v2' % (scheme, plexpy.CONFIG.HTTP_PORT, plexpy.HTTP_ROOT)
+
+    def _image_hash(img, rating_key, fallback, opacity=None, background=None, blur=None):
+        # Reproduit ce que Tautulli fait pour ses propres cartes "recently added" :
+        # transforme un chemin d'image Plex en hash utilisable avec base_url_image.
+        # Pour l'image de fond ("art"), Tautulli assombrit/floute l'image (opacity/
+        # background/blur) pour que le texte blanc reste lisible par-dessus ; on
+        # reproduit ce comportement en passant les mêmes paramètres.
+        # Selon la version de Tautulli, 'data' peut être directement la chaîne du hash,
+        # ou un dict contenant le hash sous une clé (img_hash / hash / ...) : on gère les deux.
+        if not img:
+            return ''
+        try:
+            params = {
+                'apikey': plexpy.CONFIG.API_KEY,
+                'cmd': 'pms_image_proxy',
+                'img': img,
+                'rating_key': rating_key,
+                'fallback': fallback,
+                'return_hash': 1,
+            }
+            if opacity is not None:
+                params['opacity'] = opacity
+            if background is not None:
+                params['background'] = background
+            if blur is not None:
+                params['blur'] = blur
+            # Les posters Maintainerr changent souvent (overlay/compte à rebours mis à jour
+            # par Maintainerr), parfois sans que le chemin d'image Plex ne change lui-même.
+            # On force donc systématiquement un nouveau traitement plutôt que de réutiliser
+            # un hash potentiellement périmé.
+            params['refresh'] = 1
+            r = requests.get(_tautulli_api_url(), params=params, timeout=20, verify=False)
+            data = (r.json().get('response') or {}).get('data')
+            if isinstance(data, str):
+                return data
+            if isinstance(data, dict):
+                for key in ('img_hash', 'hash', 'image_hash', 'filename', 'img'):
+                    val = data.get(key)
+                    if isinstance(val, str) and val:
+                        return val
+                for val in data.values():
+                    if isinstance(val, str) and val:
+                        return val
+            return ''
+        except Exception as e:
+            logger.warn("Newsletter Maintainerr :: Impossible de hasher l'image : %s" % e)
+            return ''
+
+    # En envoi réel (pas en preview) avec Cloudinary, Tautulli remplit lui-même
+    # thumb_url / art_url pour ses propres cartes en uploadant les images.
+    # Pour nos cartes custom, on doit donc le faire nous-mêmes.
+    _upload_to_cloudinary_mode = (not preview) and service == 'cloudinary'
+
+    def _image_url_cloudinary(img, rating_key, fallback, width, height, opacity=None, background=None, blur=None, transform=''):
+        # Récupère l'image traitée via l'API Tautulli (sans return_hash => octets de l'image),
+        # puis l'upload sur Cloudinary et renvoie l'URL publique (https).
+        if not img:
+            return ''
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            params = {
+                'apikey': plexpy.CONFIG.API_KEY,
+                'cmd': 'pms_image_proxy',
+                'img': img,
+                'rating_key': rating_key,
+                'fallback': fallback,
+                'width': width,
+                'height': height,
+                'refresh': 1,
+            }
+            if opacity is not None:
+                params['opacity'] = opacity
+            if background is not None:
+                params['background'] = background
+            if blur is not None:
+                params['blur'] = blur
+            r = requests.get(_tautulli_api_url(), params=params, timeout=30, verify=False)
+            r.raise_for_status()
+            if not r.content or 'image' not in (r.headers.get('Content-Type') or ''):
+                logger.warn("Newsletter Maintainerr :: Réponse non-image pour %s (%s)" % (rating_key, fallback))
+                return ''
+            cloudinary.config(
+                cloud_name=plexpy.CONFIG.CLOUDINARY_CLOUD_NAME,
+                api_key=plexpy.CONFIG.CLOUDINARY_API_KEY,
+                api_secret=plexpy.CONFIG.CLOUDINARY_API_SECRET
+            )
+            # public_id dédié (préfixe maintainerr_) pour ne pas écraser les images
+            # que Tautulli uploade pour les "recently added" (poster_<rating_key>).
+            resp = cloudinary.uploader.upload(
+                r.content,
+                public_id='maintainerr_%s_%s' % (fallback, rating_key),
+                resource_type='image',
+                overwrite=True,
+                invalidate=True,
+                tags=['tautulli', 'maintainerr']
+            )
+            url = resp.get('secure_url') or resp.get('url') or ''
+            if url and transform:
+                url = url.replace('/upload/', '/upload/%s/' % transform, 1)
+            return url
+        except Exception as e:
+            logger.warn("Newsletter Maintainerr :: Upload Cloudinary impossible (%s) : %s" % (rating_key, e))
+            return ''
+
+    def _maintainerr_get(path, params=None):
+        try:
+            r = requests.get(MAINTAINERR_URL.rstrip('/') + path, params=params or {}, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.warn("Newsletter Maintainerr :: Erreur API Maintainerr (%s) : %s" % (path, e))
+            return None
+
+    def _parse_iso(dt_str):
+        # Ex: "2026-06-05T00:00:00.000Z"
+        try:
+            return datetime.datetime.strptime(dt_str.split('.')[0], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            return None
+
+    # On ne récupère la liste des collections Maintainerr qu'une seule fois.
+    _all_maintainerr_collections = _maintainerr_get('/api/collections')
+    if not isinstance(_all_maintainerr_collections, list):
+        _all_maintainerr_collections = []
+
+    def _find_maintainerr_collection(name):
+        for c in _all_maintainerr_collections:
+            if c.get('title') == name:
+                return c
+        return None
+
+    def _get_upcoming_deletions(name, days_ahead):
+        results = []
+        collection = _find_maintainerr_collection(name)
+        if not collection:
+            logger.warn("Newsletter Maintainerr :: Collection '%s' introuvable dans Maintainerr." % name)
+            return results
+        collection_id = collection.get('id')
+        delete_after_days = collection.get('deleteAfterDays') or 0
+        media_rows = _maintainerr_get('/api/collections/media', params={'collectionId': collection_id})
+        if not isinstance(media_rows, list):
+            return results
+
+        now = datetime.datetime.utcnow()
+        cutoff = now + datetime.timedelta(days=days_ahead)
+
+        for row in media_rows:
+            add_date = _parse_iso(row.get('addDate') or '')
+            if not add_date:
+                continue
+            deletion_date = add_date + datetime.timedelta(days=delete_after_days)
+            if deletion_date > cutoff:
+                continue  # sera supprimé trop tard, on ne l'affiche pas encore
+            rating_key = row.get('mediaServerId')
+            if not rating_key:
+                continue
+            days_left = max(0, (deletion_date - now).days)
+            results.append({'rating_key': rating_key, 'deletion_date': deletion_date, 'days_left': days_left})
+
+        results.sort(key=lambda r: r['deletion_date'])
+        return results
+
+    def _get_collection_media(pms, name, days_ahead):
+        results = []
+        try:
+            upcoming = _get_upcoming_deletions(name, days_ahead)
+            for entry in upcoming:
+                details = pms.get_metadata_details(rating_key=entry['rating_key'], media_info=False)
+                if not details:
+                    continue
+                thumb_src = details.get('thumb') or details.get('parent_thumb') or details.get('grandparent_thumb') or ''
+                art_src = details.get('art') or ''
+                # Poster : pleine opacité, pas de flou (comme "recently added")
+                details['thumb_hash'] = _image_hash(thumb_src, entry['rating_key'], 'poster', opacity=100, background='000000')
+                # Fond de carte : assombri + flouté pour garder le texte lisible
+                details['art_hash'] = _image_hash(art_src, entry['rating_key'], 'art', opacity=60, background='282828', blur=3)
+                if _upload_to_cloudinary_mode:
+                    details['thumb_url'] = _image_url_cloudinary(thumb_src, entry['rating_key'], 'poster', 300, 450, opacity=100, background='000000', transform='c_fill,f_auto,h_225,q_auto,w_150')
+                    details['art_url'] = _image_url_cloudinary(art_src, entry['rating_key'], 'art', 1000, 563, opacity=60, background='282828', blur=3, transform='f_auto,q_auto')
+                else:
+                    details['thumb_url'] = ''
+                    details['art_url'] = ''
+                details['days_left'] = entry['days_left']
+                results.append(details)
+        except Exception as e:
+            logger.warn("Newsletter Maintainerr :: Lecture de la collection '%s' impossible : %s" % (name, e))
+        return results
+
+    try:
+        _pms_connect = PmsConnect()
+        maintainerr_sections = []
+        for _cfg in MAINTAINERR_COLLECTIONS:
+            _media_list = _get_collection_media(_pms_connect, _cfg['collection_name'], MAINTAINERR_DAYS_AHEAD)
+            if _media_list:
+                maintainerr_sections.append({'heading': _cfg['heading'], 'items': _media_list})
+    except Exception as e:
+        logger.warn("Newsletter Maintainerr :: Erreur générale section Maintainerr : %s" % e)
+        maintainerr_sections = []
+%>
+<!doctype html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width">
+    <meta name="color-scheme" content="light dark">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <title>Tautulli Newsletter - ${subject}</title>
+    <link rel="shortcut icon" href="${base_url_image + 'images/favicon/favicon.ico' if base_url_image else 'https://tautulli.com/images/favicon.ico'}">
+    <style>
+        /* -------------------------------------
+            GLOBAL RESETS
+        ------------------------------------- */
+        img {
+            border: none;
+            -ms-interpolation-mode: bicubic;
+            max-width: 100%;
+        }
+
+        body {
+            font-family: 'Open Sans', Helvetica, Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            font-size: 14px;
+            line-height: 1.4;
+            margin: 0;
+            padding: 0;
+            -ms-text-size-adjust: 100%;
+            -webkit-text-size-adjust: 100%;
+        }
+
+        table {
+            border-collapse: separate;
+            mso-table-lspace: 0pt;
+            mso-table-rspace: 0pt;
+            width: 100%;
+        }
+
+        table td {
+            font-family: 'Open Sans', Helvetica, Arial, sans-serif;
+            font-size: 14px;
+            vertical-align: top;
+        }
+
+        /* -------------------------------------
+            BODY & CONTAINER
+        ------------------------------------- */
+
+        .body {
+            width: 100%;
+        }
+
+        .container {
+            display: block;
+            margin: 0 auto !important;
+            max-width: 1042px;
+            padding: 10px;
+            width: 1042px;
+        }
+
+        .content {
+            box-sizing: border-box;
+            display: block;
+            margin: 0 auto;
+            max-width: 1037px;
+            padding: 10px;
+        }
+
+        /* -------------------------------------
+            HEADER, FOOTER, MAIN
+        ------------------------------------- */
+        .local-preview-note {
+            text-align: center;
+            padding-top: 10px;
+        }
+        .local-preview-note p {
+            color: #282A2D;
+            font-size: 12px;
+        }
+        .main {
+            background: #282A2D;
+            border-radius: 3px;
+            width: 100%;
+            color: #ffffff;
+        }
+
+        .wrapper {
+            box-sizing: border-box;
+            padding: 5px;
+            overflow: auto;
+        }
+
+        .content-block {
+            padding-bottom: 10px;
+            padding-top: 10px;
+        }
+
+        .footer {
+            clear: both;
+            margin-top: 10px;
+            text-align: center;
+            width: 100%;
+            font-size: 12px;
+        }
+        .footer-bar {
+            margin-left: auto;
+            margin-right: auto;
+            width: 200px;
+            border-top: 1px solid #E5A00D;
+            margin-top: 25px;
+        }
+
+        .footer td,
+        .footer p,
+        .footer span,
+        .footer a {
+            color: #fff;
+            font-size: 12px;
+            text-align: center;
+        }
+
+        /* -------------------------------------
+            TYPOGRAPHY
+        ------------------------------------- */
+        h1,
+        h2,
+        h3,
+        h4 {
+            color: #ffffff;
+            font-family: 'Open Sans', Helvetica, Arial, sans-serif;
+            font-weight: 400;
+            margin: 0;
+        }
+
+        p,
+        ul,
+        ol {
+            font-family: 'Open Sans', Helvetica, Arial, sans-serif;
+            font-weight: 400;
+            margin: 0;
+        }
+
+        p li,
+        ul li,
+        ol li {
+            list-style-position: inside;
+            margin-left: 5px;
+        }
+
+        a {
+            text-decoration: underline;
+        }
+
+        /* -------------------------------------
+            OTHER STYLES THAT MIGHT BE USEFUL
+        ------------------------------------- */
+        .mb5 {
+            margin-bottom: 5px;
+        }
+
+        .nowrap {
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            overflow: hidden;
+        }
+
+        .preheader {
+            color: transparent;
+            display: none;
+            height: 0;
+            max-height: 0;
+            max-width: 0;
+            opacity: 0;
+            overflow: hidden;
+            mso-hide: all;
+            visibility: hidden;
+            width: 0;
+        }
+        .view-full {
+            clear: both;
+            color: #282A2D;
+            font-size: 12px;
+            margin-bottom: 10px;
+            text-align: center;
+            width: 100%;
+        }
+        .view-full a {
+            color: #282A2D;
+        }
+
+        .powered-by a {
+            text-decoration: underline;
+        }
+
+        /* -------------------------------------
+            HEADER
+        ------------------------------------- */
+        .header {
+            width: 100%;
+            height: 90px;
+            text-align: center;
+        }
+        .header-img {
+            width: 492px;
+            height: 90px;
+            margin-left: -35px;
+        }
+        .server-name {
+            font-size: 30px;
+            text-align: center;
+        }
+        .dates {
+            color: #aaaaaa;
+            font-size: 20px;
+            text-align: center;
+        }
+        .body-message {
+            font-size: 20px;
+            text-align: center;
+            width: 80%;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        /* -------------------------------------
+            MEDIA SECTIONS
+        ------------------------------------- */
+        h2 {
+            font-size: 30px;
+            font-weight: 300;
+            margin: 20px 10px 0 10px;
+            text-align: center;
+        }
+
+        h3 {
+            font-size: 25px;
+            font-weight: 300;
+            margin: 0 0 10px 0;
+        }
+
+        .sub-header-icon {
+            height: 30px;
+            width: 30px;
+            vertical-align: middle;
+            margin-right: 5px;
+            margin-bottom: 5px;
+        }
+        .sub-header-bar {
+            margin-left: auto;
+            margin-right: auto;
+            font-size: 30px;
+            text-align: center;
+            width: 200px;
+            border-top: 1px solid #E5A00D;
+            margin-top: 15px;
+            margin-bottom: 25px;
+        }
+        .sub-header-title {
+            margin-left: auto;
+            margin-right: auto;
+            font-size: 30px;
+            text-align: center;
+            font-weight: lighter;
+        }
+        .sub-header-count {
+            margin-left: auto;
+            margin-right: auto;
+            font-size: 30px;
+            text-align: center;
+        }
+        .sub-header-count .count {
+            color: #E5A00D;
+        }
+        .sub-header-count .count-units {
+            color: #aaaaaa;
+            font-size: 20px;
+            text-transform: uppercase;
+        }
+
+        /* -------------------------------------
+            MEDIA CARDS
+        ------------------------------------- */
+        .card-instance {
+            font-size: 12px;
+            overflow: hidden;
+            padding: 3px;
+            width: 502px;
+            min-width: 502px;
+            max-width: 502px;
+        }
+        .card-instance.pad {
+            padding: 0 !important;
+            width: 251px !important;
+            min-width: 251px !important;
+            max-width: 251px !important;
+        }
+        .card-instance.movie,
+        .card-instance.show {
+            height: 233px;
+        }
+        .card-instance.album {
+            height: 158px;
+        }
+        .card-background {
+            background-color: #282828;
+            background-position: center;
+            background-size: cover;
+            background-repeat: no-repeat;
+            background-clip: padding-box;
+            border: 1px solid rgba(255,255,255,.1);
+        }
+        .card-poster-container {
+            width: 152px;
+            min-width: 152px;
+        }
+        .card-instance.movie .card-poster-container,
+        .card-instance.show .card-poster-container{
+            height: 227px;
+        }
+        .card-instance.album .card-poster-container {
+            height: 152px;
+        }
+        .card-poster {
+            background-color: #3F4245;
+            background-position: center;
+            background-size: cover;
+            background-repeat: no-repeat;
+            background-clip: padding-box;
+            border: 1px solid rgba(255,255,255,.1);
+        }
+        .card-poster-overlay {
+            display: block;
+        }
+        .card-info-container {
+            padding-left: 4px;
+            text-align: left;
+        }
+        .card-instance.movie .card-info-container,
+        .card-instance.show .card-info-container{
+            height: 227px;
+        }
+        .card-instance.album .card-info-container {
+            height: 152px;
+        }
+        .card-info-container .card-info-container-table {
+            height: 100%;
+        }
+        .card-info-title {
+            border-bottom: 1px solid rgba(255, 255, 255, .1);
+            line-height: 1.2rem;
+            font-size: 0.9rem;
+            padding: 5px;
+            max-width: 320px;
+        }
+        .card-info-title a {
+            text-decoration: none;
+            color: #ffffff;
+        }
+        .card-info-body {
+            font-size: 0.75rem;
+            padding: 5px;
+            height: 100%;
+        }
+        .card-info-body > p {
+            max-width: 325px;
+            color: #ffffff;
+        }
+        .card-instance.movie .card-info-body,
+        .card-instance.show .card-info-body {
+        }
+        .card-instance.album .card-info-body {
+            height: 82px;
+            min-height: 82px;
+        }
+        .card-info-footer {
+            font-size: 0.6rem;
+            padding-top: 0px;
+            padding-right: 5px;
+            padding-bottom: 5px;
+            padding-left: 5px;
+        }
+        .card-info-footer .badge-container {
+            max-width: 260px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .card-info-footer .star-rating-container {
+            width: 65px;
+        }
+        .card-info-footer .star-rating {
+            margin-left: 4px;
+            font-size: 0.8rem;
+            line-height: 1rem;
+            width: 0.5rem;
+            display: inline-block;
+            vertical-align: bottom;
+        }
+        .star-rating.full {
+            color: #E5A00D;
+        }
+        .star-rating.empty {
+            color: #aaaaaa;
+        }
+        .badge {
+            display: inline-block;
+            min-width: 10px;
+            margin-right: 4px;
+            padding: 3px 7px;
+            font-size: 11px;
+            line-height: 1;
+            text-align: center;
+            white-space: nowrap;
+            vertical-align: middle;
+            background-color: rgba(0, 0, 0, .25);
+            border-radius: 2px;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            color: #ffffff;
+        }
+
+        /* -------------------------------------
+            RESPONSIVE AND MOBILE FRIENDLY STYLES
+        ------------------------------------- */
+        @media only screen and (max-width: 1040px) {
+            .card-instance {
+                display: block !important;
+                margin-top: 0 !important;
+                margin-right: auto !important;
+                margin-bottom: 0 !important;
+                margin-left: auto !important;
+            }
+
+            table[class=body] .header {
+                height: 75px !important;
+            }
+            table[class=body] .header-img {
+                width: 410px;
+                height: 75px;
+                margin-left: -30px;
+            }
+
+            table[class=body] h1 {
+                font-size: 28px !important;
+                margin-bottom: 10px !important;
+            }
+
+            table[class=body] .server-name {
+                font-size: 20px !important;
+            }
+            table[class=body] .dates,
+            table[class=body] .body-message {
+                font-size: 14px !important;
+            }
+            table[class=body] .sub-header > div {
+                font-size: 20px !important;
+            }
+            table[class=body] .sub-header-title {
+                font-size: 20px !important;
+            }
+            table[class=body] .sub-header-icon {
+                height: 20px !important;
+                width: 20px !important;
+            }
+            table[class=body] .count {
+                font-size: 20px !important;
+            }
+            table[class=body] .count-units {
+                font-size: 14px !important;
+            }
+
+            table[class=body] .content {
+                padding: 0 !important;
+            }
+
+            table[class=body] .container {
+                padding: 0 !important;
+                width: 100% !important;
+            }
+
+            table[class=body] .main {
+                border-left-width: 0 !important;
+                border-radius: 0 !important;
+                border-right-width: 0 !important;
+            }
+        }
+
+        /* -------------------------------------
+            PRESERVE THESE STYLES IN THE HEAD
+        ------------------------------------- */
+        @media all {
+            .ExternalClass {
+                width: 100%;
+            }
+
+            .ExternalClass,
+            .ExternalClass p,
+            .ExternalClass span,
+            .ExternalClass font,
+            .ExternalClass td,
+            .ExternalClass div {
+                line-height: 100%;
+            }
+
+            a[x-apple-data-detectors] {
+                color: inherit !important;
+                font-family: inherit !important;
+                font-size: inherit !important;
+                font-weight: inherit !important;
+                line-height: inherit !important;
+                text-decoration: none !important;
+            }
+        }
+
+    </style>
+</head>
+<body style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;-webkit-font-smoothing: antialiased;font-size: 14px;line-height: 1.4;margin: 0;padding: 0;-ms-text-size-adjust: 100%;-webkit-text-size-adjust: 100%;">
+% if preview and service and service != 'self-hosted':
+<div class="local-preview-note" style="text-align: center;padding-top: 10px;"><p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;color: #282A2D;font-size: 12px;">Note: Local preview images only - images will be uploaded to ${service.capitalize()} when the newsletter is sent.</p></div>  <!-- IGNORE SAVE -->
+% elif preview and not service:
+<div class="local-preview-note" style="text-align: center;padding-top: 10px;"><p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;color: #282A2D;font-size: 12px;">Warning: The Image Hosting setting must be enabled for images to display on the newsletter.</p></div>  <!-- IGNORE SAVE -->
+% endif
+<table border="0" cellpadding="0" cellspacing="0" class="body" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+    <tr>
+        <td class="container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;display: block;max-width: 1042px;padding: 10px;width: 1042px;margin: 0 auto !important;">
+            <div class="content" style="box-sizing: border-box;display: block;margin: 0 auto;max-width: 1037px;padding: 10px;">
+                <span class="preheader" style="color: transparent;display: none;height: 0;max-height: 0;max-width: 0;opacity: 0;overflow: hidden;mso-hide: all;visibility: hidden;width: 0;">Tautulli Newsletter  - ${subject}</span>
+                % if base_url and not preview:
+                <div class="view-full" style="clear: both;color: #282A2D;font-size: 12px;margin-bottom: 10px;text-align: center;width: 100%;">  <!-- IGNORE SAVE -->
+                    <a href="${base_url + uuid}" title="View full newsletter" target="_blank" rel="noreferrer" style="text-decoration: underline;color: #282A2D;">Click here to view the full newsletter.</a>  <!-- IGNORE SAVE -->
+                </div>  <!-- IGNORE SAVE -->
+                % endif
+                <table border="0" cellpadding="3" cellspacing="0" class="main" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background: #282A2D;border-radius: 3px;color: #ffffff;">
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="header" style="width: 100%;height: 90px;text-align: center;">
+                                <img src="${base_url_image + 'images/newsletter/newsletter-header.png' if base_url_image else 'https://tautulli.com/images/newsletter/newsletter-header.png'}" class="header-img" width="492" height="90" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;width: 492px;height: 90px;margin-left: -35px;">
+                            </div>
+                            <div class="server-name" style="font-size: 30px;text-align: center;">${parameters['server_name']}</div>
+                            <div class="dates" style="color: #aaaaaa;font-size: 20px;text-align: center;">${parameters['start_date']} - ${parameters['end_date']}</div>
+                        </td>
+                    </tr>
+                    % if message:
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="body-message" style="font-size: 20px;text-align: center;width: 80%;margin-left: auto;margin-right: auto;">${'<br>'.join(l for l in message.splitlines()) | n}</div>
+                        </td>
+                    </tr>
+                    % endif
+                    % if recently_added.get('movie'):
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="sub-header-title" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;font-weight: lighter;">
+                                <img src="${(base_url_image + 'images/libraries/movie.png') if base_url_image else 'https://tautulli.com/images/libraries/movie.png'}" class="sub-header-icon" width="30" height="30" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;height: 30px;width: 30px;vertical-align: middle;margin-right: 5px;margin-bottom: 5px;"> Recently Added Movies
+                            </div>
+                            <div class="sub-header-count" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;">
+                                <span class="count" style="color: #E5A00D;">${len(recently_added['movie'])}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">movie${'s' if len(recently_added['movie']) > 1 else ''}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                % for movie_a, movie_b in grouper(recently_added['movie'], 2):
+                                <tr>
+                                    <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                            <tr>
+                                                % for movie in (movie_a, movie_b):
+                                                % if movie:
+                                                % if not movie_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                <td align="center" valign="top" class="card-instance movie" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 3px;width: 502px;min-width: 502px;max-width: 502px;height: 233px;">
+                                                    <table border="0" cellpadding="0" cellspacing="3" width="100%" class="card-background" style="background-image: url(${(base_url_image + movie['art_hash']) if base_url_image else movie['art_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #282828;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                        <tr>
+                                                            <td class="card-poster-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 152px;min-width: 152px;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-poster" style="background-image: url(${(base_url_image + movie['thumb_hash']) if base_url_image else movie['thumb_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #3F4245;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                                    <tr>
+                                                                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${movie['rating_key']}" title="${movie['title']}" target="_blank" rel="noreferrer" style="text-decoration: underline;">
+                                                                                <img class="card-poster-overlay" src="${base_url_image + 'images/newsletter/view-on-plex-poster.png' if base_url_image else 'https://tautulli.com/images/newsletter/view-on-plex-poster.png'}" width="150" height="225" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;display: block;">
+                                                                            </a>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                            <td class="card-info-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;padding-left: 4px;text-align: left;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-info-container-table" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;height: 100%;">
+                                                                    <tr>
+                                                                        <td class="card-info-title nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.9rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;border-bottom: 1px solid rgba(255, 255, 255, .1);line-height: 1.2rem;padding: 5px;max-width: 320px;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${movie['rating_key']}" title="${movie['title']}" target="_blank" rel="noreferrer" style="text-decoration: none;color: #ffffff;">${movie['title']}</a>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-body" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.75rem;vertical-align: top;padding: 5px;height: 100%;">
+                                                                            % if movie['tagline']:
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                <em>${movie['tagline']}</em>
+                                                                            </p>
+                                                                            % endif
+                                                                            <p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;max-width: 325px;color: #ffffff;">
+                                                                                ${movie['summary'][:450] + (movie['summary'][450:] and '...')}
+                                                                            </p>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-footer nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.6rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;padding-top: 0px;padding-right: 5px;padding-bottom: 5px;padding-left: 5px;">
+                                                                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                <tr>
+                                                                                    <td class="badge-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;max-width: 260px;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % if movie['year']:
+                                                                                                <td class="badge" title="${movie['year']}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${movie['year']}</td>
+                                                                                                % endif
+                                                                                                % if movie['duration']:
+                                                                                                <% duration = int(int(movie['duration'])/60000) %>
+                                                                                                <td class="badge" title="${duration} mins" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${duration} mins</td>
+                                                                                                % endif
+                                                                                                % if movie['genres']:
+                                                                                                % for genre in movie['genres'][:]:
+                                                                                                <td class="badge" title="${genre}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${genre}</td>
+                                                                                                % endfor
+                                                                                                % endif
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % if movie['rating'] or movie['audience_rating']:
+                                                                                    <% rating = int(round(float(movie['rating'] or movie['audience_rating']) / 2)) %>
+                                                                                    <td class="star-rating-container" title="${int(float(movie['rating'] or movie['audience_rating'])/0.1)}%" align="right" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 65px;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % for _ in range(rating):
+                                                                                                <td class="star-rating full" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #E5A00D;">&#9733;</td>
+                                                                                                % endfor
+                                                                                                % for _ in range(5-rating):
+                                                                                                <td class="star-rating empty" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #aaaaaa;">&#9734;</td>
+                                                                                                % endfor
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % endif
+                                                                                </tr>
+                                                                            </table>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                                % if not movie_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                % endif
+                                                % endfor
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                % endfor
+                            </table>
+                        </td>
+                    </tr>
+                    % endif
+                    % if recently_added.get('show'):
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="sub-header-title" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;font-weight: lighter;">
+                                <img src="${(base_url_image + 'images/libraries/show.png') if base_url_image else 'https://tautulli.com/images/libraries/show.png'}" class="sub-header-icon" width="30" height="30" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;height: 30px;width: 30px;vertical-align: middle;margin-right: 5px;margin-bottom: 5px;"> Recently Added TV Shows
+                            </div>
+                            <div class="sub-header-count" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;">
+                                <span class="count" style="color: #E5A00D;">${len(recently_added['show'])}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">show${'s' if len(recently_added['show']) > 1 else ''}</span>&nbsp;/&nbsp;
+                                <% total_episodes = sum(season['episode_count'] for show in recently_added['show'] for season in show['season']) %>
+                                <span class="count" style="color: #E5A00D;">${total_episodes}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">episode${'s' if total_episodes > 1 else ''}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                % for show_a, show_b in grouper(recently_added['show'], 2):
+                                <tr>
+                                    <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                            <tr>
+                                                % for show in (show_a, show_b):
+                                                % if show:
+                                                % if not show_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                <%
+                                                    if show['season_count'] == 1:
+                                                        if show['season'][0]['episode_count'] == 1:
+                                                            link_rating_key = show['season'][0]['episode'][0]['rating_key']
+                                                        else:
+                                                            link_rating_key = show['season'][0]['episode'][0]['parent_rating_key']
+                                                    else:
+                                                        link_rating_key = show['rating_key']
+                                                %>
+                                                <td align="center" valign="top" class="card-instance show" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 3px;width: 502px;min-width: 502px;max-width: 502px;height: 233px;">
+                                                    <table border="0" cellpadding="0" cellspacing="3" width="100%" class="card-background" style="background-image: url(${(base_url_image + show['art_hash']) if base_url_image else show['art_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #282828;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                        <tr>
+                                                            <td class="card-poster-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 152px;min-width: 152px;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-poster" style="background-image: url(${(base_url_image + show['thumb_hash']) if base_url_image else show['thumb_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #3F4245;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                                    <tr>
+                                                                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${link_rating_key}" title="${show['title']}" target="_blank" rel="noreferrer" style="text-decoration: underline;">
+                                                                                <img class="card-poster-overlay" src="${base_url_image + 'images/newsletter/view-on-plex-poster.png' if base_url_image else 'https://tautulli.com/images/newsletter/view-on-plex-poster.png'}" width="150" height="225" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;display: block;">
+                                                                            </a>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                            <td class="card-info-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;padding-left: 4px;text-align: left;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-info-container-table" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;height: 100%;">
+                                                                    <tr>
+                                                                        <td class="card-info-title nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.9rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;border-bottom: 1px solid rgba(255, 255, 255, .1);line-height: 1.2rem;padding: 5px;max-width: 320px;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${link_rating_key}" title="${show['title']}" target="_blank" rel="noreferrer" style="text-decoration: none;color: #ffffff;">${show['title']}</a>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-body" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.75rem;vertical-align: top;padding: 5px;height: 100%;">
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                % if show['season_count'] > 1:
+                                                                                    <em>${show['season_count']} seasons&nbsp;/&nbsp;</em>
+                                                                                % endif
+                                                                                <% total_show_episodes = sum(s['episode_count'] for s in show['season']) %>
+                                                                                <em>${total_show_episodes} episode${'s' if total_show_episodes > 1 else ''}</em>
+                                                                            </p>
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                % for i, season in enumerate(show['season'][:8]):
+                                                                                    % if season['episode_count'] == 1:
+                                                                                        ${season['title']} &middot; Episode ${season['episode'][0]['media_index']} - ${season['episode'][0]['title']}
+                                                                                    % else:
+                                                                                        ${season['title']} &middot; Episodes ${season['episode_range']}
+                                                                                    % endif
+                                                                                    % if i < min(show['season_count'], 7):
+                                                                                        <br>
+                                                                                    % elif i == 7 and show['season_count'] > 8:
+                                                                                        <% remaining_seasons = show['season_count'] - 8 %>
+                                                                                        ...plus ${remaining_seasons} more season${'s' if remaining_seasons > 1 else ''}!
+                                                                                    % endif
+                                                                                % endfor
+                                                                            </p>
+                                                                            <p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;max-width: 325px;color: #ffffff;">
+                                                                                % if show['season_count'] == 1 and show['season'][0]['episode_count'] == 1:
+                                                                                ${show['season'][0]['episode'][0]['summary'][:350] + (show['season'][0]['episode'][0]['summary'][350:] and '...')}
+                                                                                % else:
+                                                                                <% length = max(0, 350 - 50 * (show['season_count'] - 1)) %>
+                                                                                    % if length:
+                                                                                    ${show['summary'][:length] + (show['summary'][length:] and '...')}
+                                                                                    % endif
+                                                                                % endif
+                                                                            </p>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-footer nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.6rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;padding-top: 0px;padding-right: 5px;padding-bottom: 5px;padding-left: 5px;">
+                                                                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                <tr>
+                                                                                    <td class="badge-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;max-width: 260px;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % if show['year']:
+                                                                                                <td class="badge" title="${show['year']}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${show['year']}</td>
+                                                                                                % endif
+                                                                                                % if show['duration']:
+                                                                                                <% duration = int(int(show['duration'])/60000) %>
+                                                                                                <td class="badge" title="${duration} mins" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${duration} mins</td>
+                                                                                                % endif
+                                                                                                % if show['genres']:
+                                                                                                % for genre in show['genres'][:2]:
+                                                                                                <td class="badge" title="${genre}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${genre}</td>
+                                                                                                % endfor
+                                                                                                % endif
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % if show['rating'] or show['audience_rating']:
+                                                                                    <% rating = int(round(float(show['rating'] or show['audience_rating']) / 2)) %>
+                                                                                    <td class="star-rating-container" title="${int(float(show['rating'] or show['audience_rating'])/0.1)}%" align="right" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 65px;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % for _ in range(rating):
+                                                                                                <td class="star-rating full" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #E5A00D;">&#9733;</td>
+                                                                                                % endfor
+                                                                                                % for _ in range(5-rating):
+                                                                                                <td class="star-rating empty" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #aaaaaa;">&#9734;</td>
+                                                                                                % endfor
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % endif
+                                                                                </tr>
+                                                                            </table>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                                % if not show_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                % endif
+                                                % endfor
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                % endfor
+                            </table>
+                        </td>
+                    </tr>
+                    % endif
+                    % if recently_added.get('artist'):
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="sub-header-title" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;font-weight: lighter;">
+                                <img src="${(base_url_image + 'images/libraries/artist.png') if base_url_image else 'https://tautulli.com/images/libraries/artist.png'}" class="sub-header-icon" width="30" height="30" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;height: 30px;width: 30px;vertical-align: middle;margin-right: 5px;margin-bottom: 5px;"> Recently Added Music
+                            </div>
+                            <div class="sub-header-count" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;">
+                                <span class="count" style="color: #E5A00D;">${len(recently_added['artist'])}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">artist${'s' if len(recently_added['artist']) > 1 else ''}</span> /
+                                <% total_albums = sum(artist['album_count'] for artist in recently_added['artist']) %>
+                                <span class="count" style="color: #E5A00D;">${total_albums}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">album${'s' if total_albums > 1 else ''}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                % for album_a, album_b in grouper([a for artist in recently_added['artist'] for a in artist['album']], 2):
+                                <tr>
+                                    <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                            <tr>
+                                                % for album in (album_a, album_b):
+                                                % if album:
+                                                % if not album_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                <td align="center" valign="top" class="card-instance album" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 3px;width: 502px;min-width: 502px;max-width: 502px;height: 158px;">
+                                                    <table border="0" cellpadding="0" cellspacing="3" width="100%" class="card-background" style="background-image: url(${(base_url_image + album['art_hash']) if base_url_image else album['art_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #282828;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                        <tr>
+                                                            <td class="card-poster-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 152px;min-width: 152px;height: 152px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-poster" style="background-image: url(${(base_url_image + album['thumb_hash']) if base_url_image else album['thumb_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #3F4245;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                                    <tr>
+                                                                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${album['rating_key']}" title="${album['title']}" target="_blank" rel="noreferrer" style="text-decoration: underline;">
+                                                                                <img class="card-poster-overlay" src="${base_url_image + 'images/newsletter/view-on-plex-cover.png' if base_url_image else 'https://tautulli.com/images/newsletter/view-on-plex-cover.png'}" width="150" height="150" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;display: block;">
+                                                                            </a>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                            <td class="card-info-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;padding-left: 4px;text-align: left;height: 152px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-info-container-table" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;height: 100%;">
+                                                                    <tr>
+                                                                        <td class="card-info-title nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.9rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;border-bottom: 1px solid rgba(255, 255, 255, .1);line-height: 1.2rem;padding: 5px;max-width: 320px;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${album['rating_key']}" title="${album['title']}" target="_blank" rel="noreferrer" style="text-decoration: none;color: #ffffff;">${album['title']}</a>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-body" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.75rem;vertical-align: top;padding: 5px;height: 82px;min-height: 82px;">
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                <em>${album['parent_title']} &middot; ${album['track_count']} track${'s' if album['track_count'] > 1 else ''}</em>
+                                                                            </p>
+                                                                            % if album['parent_title'].lower() != 'various artists':
+                                                                            <p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;max-width: 325px;color: #ffffff;">
+                                                                                ${album['summary'][:200] + (album['summary'][200:] and '...')}
+                                                                            </p>
+                                                                            % endif
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-footer nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.6rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;padding-top: 0px;padding-right: 5px;padding-bottom: 5px;padding-left: 5px;">
+                                                                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                <tr>
+                                                                                    <td class="badge-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;max-width: 260px;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % if album['year']:
+                                                                                                <td class="badge" title="${album['year']}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${album['year']}</td>
+                                                                                                % endif
+                                                                                                % if album['genres']:
+                                                                                                % for genre in album['genres'][:2]:
+                                                                                                <td class="badge" title="${genre}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${genre}</td>
+                                                                                                % endfor
+                                                                                                % endif
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % if album['rating'] or album['audience_rating']:
+                                                                                    <% rating = int(round(float(album['rating'] or album['audience_rating']) / 2)) %>
+                                                                                    <td class="star-rating-container" title="${int(float(album['rating'] or album['audience_rating'])/0.1)}%" align="right" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 65px;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % for _ in range(rating):
+                                                                                                <td class="star-rating full" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #E5A00D;">&#9733;</td>
+                                                                                                % endfor
+                                                                                                % for _ in range(5-rating):
+                                                                                                <td class="star-rating empty" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #aaaaaa;">&#9734;</td>
+                                                                                                % endfor
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % endif
+                                                                                </tr>
+                                                                            </table>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                                % if not album_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                % endif
+                                                % endfor
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                % endfor
+                            </table>
+                        </td>
+                    </tr>
+                    % endif
+                    % if recently_added.get('other_video'):
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="sub-header-title" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;font-weight: lighter;">
+                                <img src="${(base_url_image + 'images/libraries/video.png') if base_url_image else 'https://tautulli.com/images/libraries/video.png'}" class="sub-header-icon" width="30" height="30" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;height: 30px;width: 30px;vertical-align: middle;margin-right: 5px;margin-bottom: 5px;"> Recently Added Videos
+                            </div>
+                            <div class="sub-header-count" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;">
+                                <span class="count" style="color: #E5A00D;">${len(recently_added['other_video'])}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">video${'s' if len(recently_added['other_video']) > 1 else ''}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                % for video_a, video_b in grouper(recently_added['other_video'], 2):
+                                <tr>
+                                    <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                            <tr>
+                                                % for video in (video_a, video_b):
+                                                % if video:
+                                                % if not video_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                <td align="center" valign="top" class="card-instance movie" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 3px;width: 502px;min-width: 502px;max-width: 502px;height: 233px;">
+                                                    <table border="0" cellpadding="0" cellspacing="3" width="100%" class="card-background" style="background-image: url(${(base_url_image + video['art_hash']) if base_url_image else video['art_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #282828;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                        <tr>
+                                                            <td class="card-poster-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 152px;min-width: 152px;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-poster" style="background-image: url(${(base_url_image + video['thumb_hash']) if base_url_image else video['thumb_url']});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #3F4245;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                                    <tr>
+                                                                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${video['rating_key']}" title="${video['title']}" target="_blank" rel="noreferrer" style="text-decoration: underline;">
+                                                                                <img class="card-poster-overlay" src="${base_url_image + 'images/newsletter/view-on-plex-poster.png' if base_url_image else 'https://tautulli.com/images/newsletter/view-on-plex-poster.png'}" width="150" height="225" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;display: block;">
+                                                                            </a>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                            <td class="card-info-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;padding-left: 4px;text-align: left;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-info-container-table" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;height: 100%;">
+                                                                    <tr>
+                                                                        <td class="card-info-title nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.9rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;border-bottom: 1px solid rgba(255, 255, 255, .1);line-height: 1.2rem;padding: 5px;max-width: 320px;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${video['rating_key']}" title="${video['title']}" target="_blank" rel="noreferrer" style="text-decoration: none;color: #ffffff;">${video['title']}</a>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-body" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.75rem;vertical-align: top;padding: 5px;height: 100%;">
+                                                                            % if video['tagline']:
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                <em>${video['tagline']}</em>
+                                                                            </p>
+                                                                            % endif
+                                                                            <p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;max-width: 325px;color: #ffffff;">
+                                                                                ${video['summary'][:450] + (video['summary'][450:] and '...')}
+                                                                            </p>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-footer nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.6rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;padding-top: 0px;padding-right: 5px;padding-bottom: 5px;padding-left: 5px;">
+                                                                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                <tr>
+                                                                                    <td class="badge-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;max-width: 260px;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % if video['year']:
+                                                                                                <td class="badge" title="${video['year']}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${video['year']}</td>
+                                                                                                % endif
+                                                                                                % if video['duration']:
+                                                                                                <% duration = int(int(video['duration'])/60000) %>
+                                                                                                <td class="badge" title="${duration} mins" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${duration} mins</td>
+                                                                                                % endif
+                                                                                                % if video['genres']:
+                                                                                                % for genre in video['genres'][:]:
+                                                                                                <td class="badge" title="${genre}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${genre}</td>
+                                                                                                % endfor
+                                                                                                % endif
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % if video['rating'] or video['audience_rating']:
+                                                                                    <% rating = int(round(float(video['rating'] or video['audience_rating']) / 2)) %>
+                                                                                    <td class="star-rating-container" title="${int(float(video['rating'] or video['audience_rating'])/0.1)}%" align="right" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 65px;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % for _ in range(rating):
+                                                                                                <td class="star-rating full" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #E5A00D;">&#9733;</td>
+                                                                                                % endfor
+                                                                                                % for _ in range(5-rating):
+                                                                                                <td class="star-rating empty" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #aaaaaa;">&#9734;</td>
+                                                                                                % endfor
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % endif
+                                                                                </tr>
+                                                                            </table>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                                % if not video_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                % endif
+                                                % endfor
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                % endfor
+                            </table>
+                        </td>
+                    </tr>
+                    % endif
+
+                    <!-- ===================================================
+                         SECTIONS MAINTAINERR : médias prochainement supprimés
+                         =================================================== -->
+                    % for section in maintainerr_sections:
+                    <tr>
+                        <td class="wrapper" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;box-sizing: border-box;padding: 5px;overflow: auto;">
+                            <div class="sub-header-bar" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;width: 200px;border-top: 1px solid #E5A00D;margin-top: 15px;margin-bottom: 25px;"></div>
+                            <div class="sub-header-title" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;font-weight: lighter;">
+                                ${section['heading']}
+                            </div>
+                            <div class="sub-header-count" style="margin-left: auto;margin-right: auto;font-size: 30px;text-align: center;">
+                                <span class="count" style="color: #E5A00D;">${len(section['items'])}</span> <span class="count-units" style="color: #aaaaaa;font-size: 20px;text-transform: uppercase;">titre${'s' if len(section['items']) > 1 else ''}</span>
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                % for item_a, item_b in grouper(section['items'], 2):
+                                <tr>
+                                    <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                            <tr>
+                                                % for item in (item_a, item_b):
+                                                % if item:
+                                                % if not item_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                <td align="center" valign="top" class="card-instance movie" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 3px;width: 502px;min-width: 502px;max-width: 502px;height: 233px;">
+                                                    <table border="0" cellpadding="0" cellspacing="3" width="100%" class="card-background" style="background-image: url(${(base_url_image + item['art_hash']) if (base_url_image and item.get('art_hash')) else item.get('art_url', '')});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #282828;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                        <tr>
+                                                            <td class="card-poster-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 152px;min-width: 152px;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-poster" style="background-image: url(${(base_url_image + item['thumb_hash']) if (base_url_image and item.get('thumb_hash')) else item.get('thumb_url', '')});border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;background-color: #3F4245;background-position: center;background-size: cover;background-repeat: no-repeat;background-clip: padding-box;border: 1px solid rgba(255,255,255,.1);">
+                                                                    <tr>
+                                                                        <td style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${item['rating_key']}" title="${item['title']}" target="_blank" rel="noreferrer" style="text-decoration: underline;">
+                                                                                <img class="card-poster-overlay" src="${base_url_image + 'images/newsletter/view-on-plex-poster.png' if base_url_image else 'https://tautulli.com/images/newsletter/view-on-plex-poster.png'}" width="150" height="225" style="border: none;-ms-interpolation-mode: bicubic;max-width: 100%;display: block;">
+                                                                            </a>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                            <td class="card-info-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;padding-left: 4px;text-align: left;height: 227px;">
+                                                                <table border="0" cellpadding="0" cellspacing="0" class="card-info-container-table" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;height: 100%;">
+                                                                    <tr>
+                                                                        <td class="card-info-title nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.9rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;border-bottom: 1px solid rgba(255, 255, 255, .1);line-height: 1.2rem;padding: 5px;max-width: 320px;">
+                                                                            <a href="${parameters['pms_web_url']}#!/server/${parameters['pms_identifier']}/details?key=%2Flibrary%2Fmetadata%2F${item['rating_key']}" title="${item['title']}" target="_blank" rel="noreferrer" style="text-decoration: none;color: #ffffff;">${item['title']}</a>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-body" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.75rem;vertical-align: top;padding: 5px;height: 100%;">
+                                                                            % if item.get('tagline'):
+                                                                            <p class="nowrap mb5" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;margin-bottom: 5px;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;max-width: 325px;color: #ffffff;">
+                                                                                <em>${item['tagline']}</em>
+                                                                            </p>
+                                                                            % endif
+                                                                            <p style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-weight: 400;margin: 0;max-width: 325px;color: #ffffff;">
+                                                                                <% _summary = item.get('summary') or '' %>
+                                                                                ${_summary[:350] + (_summary[350:] and '...')}
+                                                                            </p>
+                                                                        </td>
+                                                                    </tr>
+                                                                    <tr>
+                                                                        <td class="card-info-footer nowrap" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.6rem;vertical-align: top;white-space: nowrap;text-overflow: ellipsis;overflow: hidden;padding-top: 0px;padding-right: 5px;padding-bottom: 5px;padding-left: 5px;">
+                                                                            <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                <tr>
+                                                                                    <td class="badge-container" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;max-width: 260px;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % if item.get('days_left') is not None:
+                                                                                                <td class="badge" title="Suppression dans ${item['days_left']} jour${'s' if item['days_left'] != 1 else ''}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(229, 160, 13, .85);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #000000;">
+                                                                                                    % if item['days_left'] <= 0:
+                                                                                                    Supprimé aujourd'hui/demain
+                                                                                                    % else:
+                                                                                                    J-${item['days_left']}
+                                                                                                    % endif
+                                                                                                </td>
+                                                                                                % endif
+                                                                                                % if item.get('year'):
+                                                                                                <td class="badge" title="${item['year']}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${item['year']}</td>
+                                                                                                % endif
+                                                                                                % if item.get('genres'):
+                                                                                                % for genre in item['genres'][:2]:
+                                                                                                <td class="badge" title="${genre}" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 11px;vertical-align: middle;display: inline-block;min-width: 10px;margin-right: 4px;padding: 3px 7px;line-height: 1;text-align: center;white-space: nowrap;background-color: rgba(0, 0, 0, .25);border-radius: 2px;text-overflow: ellipsis;overflow: hidden;color: #ffffff;">${genre}</td>
+                                                                                                % endfor
+                                                                                                % endif
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % if item.get('rating') or item.get('audience_rating'):
+                                                                                    <% _rating = int(round(float(item['rating'] or item['audience_rating']) / 2)) %>
+                                                                                    <td class="star-rating-container" title="${int(float(item['rating'] or item['audience_rating'])/0.1)}%" align="right" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 14px;vertical-align: top;width: 65px;">
+                                                                                        <table border="0" cellpadding="0" cellspacing="0" style="border-collapse: separate;mso-table-lspace: 0pt;mso-table-rspace: 0pt;width: 100%;">
+                                                                                            <tr>
+                                                                                                % for _ in range(_rating):
+                                                                                                <td class="star-rating full" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #E5A00D;">&#9733;</td>
+                                                                                                % endfor
+                                                                                                % for _ in range(5-_rating):
+                                                                                                <td class="star-rating empty" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 0.8rem;vertical-align: bottom;margin-left: 4px;line-height: 1rem;width: 0.5rem;display: inline-block;color: #aaaaaa;">&#9734;</td>
+                                                                                                % endfor
+                                                                                            </tr>
+                                                                                        </table>
+                                                                                    </td>
+                                                                                    % endif
+                                                                                </tr>
+                                                                            </table>
+                                                                        </td>
+                                                                    </tr>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                    </table>
+                                                </td>
+                                                % if not item_b:
+                                                <td align="center" valign="top" class="card-instance pad" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;overflow: hidden;padding: 0 !important;width: 251px !important;min-width: 251px !important;max-width: 251px !important;"></td>
+                                                % endif
+                                                % endif
+                                                % endfor
+                                            </tr>
+                                        </table>
+                                    </td>
+                                </tr>
+                                % endfor
+                            </table>
+                        </td>
+                    </tr>
+                    % endfor
+
+                    <tr>
+                        <td class="footer" style="font-family: 'Open Sans', Helvetica, Arial, sans-serif;font-size: 12px;vertical-align: top;clear: both;margin-top: 10px;text-align: center;width: 100%;">
+                            <div class="footer-bar" style="margin-left: auto;margin-right: auto;width: 200px;border-top: 1px solid #E5A00D;margin-top: 25px;"></div>
+                            <div class="content-block powered-by" style="padding-bottom: 10px;padding-top: 10px;">
+                                <!-- FOOTER MESSAGE - DO NOT REMOVE -->
+                            </div>
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </td>
+    </tr>
+</table>
+</body>
+</html>
+% endif
